@@ -11,9 +11,18 @@
  * inside this package, so no caller can hand a store a hash of its own choosing.
  */
 
-export { AuditLog, type AuditLogOptions } from "./log.js";
+export { AuditLog, type AuditLogOptions, type CheckpointOptions } from "./log.js";
 export { canonicalJson, parsePayload } from "./canonical.js";
 export { GENESIS_HASH, entryHash, isHash, verifyChain, type VerifyOptions } from "./chain.js";
+export {
+  decodeSignedAnchor,
+  encodeSignedAnchor,
+  generateSigningKey,
+  openSignedAnchor,
+  publicKeyId,
+  signAnchor,
+  type SigningKeyPair,
+} from "./signature.js";
 export {
   decodeEntries,
   decodeEntry,
@@ -31,6 +40,7 @@ export {
   type PostgresStoreOptions,
 } from "./store/postgres.js";
 export {
+  AnchorSignatureError,
   InvalidPayloadError,
   MalformedEntryError,
   NonMonotonicTimeError,
@@ -43,5 +53,6 @@ export {
   type EntryDraft,
   type SealedEntry,
   type Sealer,
+  type SignedAnchor,
   type VerificationResult,
 } from "./types.js";

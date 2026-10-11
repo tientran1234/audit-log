@@ -1,5 +1,6 @@
 import { canonicalJson } from "./canonical.js";
 import { seal, verifyChain, type VerifyOptions } from "./chain.js";
+import { signAnchor } from "./signature.js";
 import {
   MalformedEntryError,
   type Anchor,
@@ -8,8 +9,16 @@ import {
   type AuditStore,
   type EntryDraft,
   type SealedEntry,
+  type SignedAnchor,
   type VerificationResult,
 } from "./types.js";
+
+export interface CheckpointOptions {
+  /** PKCS#8 PEM for an ed25519 key. See `generateSigningKey`. */
+  readonly privateKeyPem: string;
+  /** Defaults to now. Covered by the signature; see {@link SignedAnchor.signedAt}. */
+  readonly signedAt?: Date;
+}
 
 export interface AuditLogOptions {
   readonly store: AuditStore;
@@ -57,6 +66,24 @@ export class AuditLog {
   /** The tenant's newest position, or undefined when it has no entries yet. */
   head(tenant: string): Promise<Anchor | undefined> {
     return this.#store.head(required(tenant, "tenant"));
+  }
+
+  /**
+   * The tenant's newest position, signed. Undefined for an empty chain: there is
+   * no position to vouch for yet, and an anchor at seq 0 would be a claim that
+   * the log is empty — which is exactly the claim a signature cannot support,
+   * since nothing distinguishes an empty log from one that was emptied.
+   *
+   * Keep the result somewhere this database cannot reach. The private key belongs
+   * somewhere this database's host cannot reach either, or the signature proves
+   * nothing that the chain did not already prove.
+   */
+  async checkpoint(tenant: string, opts: CheckpointOptions): Promise<SignedAnchor | undefined> {
+    const head = await this.head(tenant);
+    if (head === undefined) return undefined;
+    return opts.signedAt === undefined
+      ? signAnchor(head, opts.privateKeyPem)
+      : signAnchor(head, opts.privateKeyPem, opts.signedAt);
   }
 
   /**

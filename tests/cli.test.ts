@@ -3,6 +3,7 @@ import { EXIT_BROKEN, EXIT_OK, EXIT_USAGE, run, type CliIo } from "../src/cli.js
 import { MemoryStore } from "../src/store/memory.js";
 import { AuditLog } from "../src/log.js";
 import { at, tenantName } from "./helpers.js";
+import { generateSigningKey, openSignedAnchor, decodeSignedAnchor } from "../src/signature.js";
 import type { AuditEntry } from "../src/types.js";
 
 interface Harness {
@@ -10,15 +11,28 @@ interface Harness {
   readonly out: string[];
   readonly err: string[];
   readonly store: MemoryStore;
+  /** What `keygen` created, with the mode it asked for. */
+  readonly written: Map<string, { readonly data: string; readonly mode: number }>;
 }
 
-function harness(store: MemoryStore, files: Record<string, string[]> = {}): Harness {
+/**
+ * `files` is read line by line (exports); `blobs` whole (keys and anchors). A
+ * file `keygen` wrote is readable afterwards, so one test can generate a key,
+ * sign with it and verify.
+ */
+function harness(
+  store: MemoryStore,
+  files: Record<string, string[]> = {},
+  blobs: Record<string, string> = {},
+): Harness {
   const out: string[] = [];
   const err: string[] = [];
+  const written = new Map<string, { data: string; mode: number }>();
   return {
     out,
     err,
     store,
+    written,
     io: {
       out: (line) => out.push(line),
       err: (line) => err.push(line),
@@ -27,6 +41,18 @@ function harness(store: MemoryStore, files: Record<string, string[]> = {}): Harn
       // nothing, so the commands' own `close()` calls are harmless here.
       openStore: async () => store,
       readLines: (path) => linesOf(files[path] ?? []),
+      readFile: async (path) => {
+        const blob = blobs[path] ?? written.get(path)?.data;
+        if (blob === undefined) throw new Error(`ENOENT: ${path}`);
+        return blob;
+      },
+      // Fails if the path exists, the way O_EXCL does on disk.
+      createFile: async (path, data, mode) => {
+        if (blobs[path] !== undefined || written.has(path)) {
+          throw new Error(`EEXIST: ${path}`);
+        }
+        written.set(path, { data, mode });
+      },
     },
   };
 }
@@ -98,7 +124,10 @@ describe("audit-log verify", () => {
   it("refuses one anchor for every tenant at once", async () => {
     const h = harness(await seed(tenantName(), 1));
     expect(await run(["verify", "--all", "--anchor", `1:${"a".repeat(64)}`], h.io)).toBe(EXIT_USAGE);
-    expect(h.err.join("\n")).toContain("--anchor names one tenant's position");
+    expect(h.err.join("\n")).toContain("an anchor names one tenant's position");
+
+    const signed = harness(await seed(tenantName(), 1));
+    expect(await run(["verify", "--all", "--anchor-file", "a.json"], signed.io)).toBe(EXIT_USAGE);
   });
 
   it("refuses a malformed anchor rather than verifying against nothing", async () => {
@@ -190,6 +219,245 @@ describe("audit-log checkpoint", () => {
     const h = harness(new MemoryStore());
     expect(await run(["checkpoint", "--tenant", "nobody"], h.io)).toBe(EXIT_OK);
     expect(h.err.join("\n")).toContain("no entries");
+  });
+});
+
+describe("audit-log keygen", () => {
+  it("writes a private key only its owner can read, and a public key beside it", async () => {
+    const h = harness(new MemoryStore());
+
+    expect(await run(["keygen", "--out", "anchors"], h.io)).toBe(EXIT_OK);
+    const key = h.written.get("anchors.key");
+    const pub = h.written.get("anchors.pub");
+
+    expect(key?.mode).toBe(0o600);
+    expect(pub?.mode).toBe(0o644);
+    expect(key?.data).toContain("BEGIN PRIVATE KEY");
+    expect(pub?.data).toContain("BEGIN PUBLIC KEY");
+    // The key id first, so it can be recorded next to whatever the anchors go in.
+    expect(h.out[0]).toMatch(/^[0-9a-f]{16} {2}anchors\.key {2}anchors\.pub$/);
+  });
+
+  it("refuses to overwrite an existing key instead of orphaning its anchors", async () => {
+    const h = harness(new MemoryStore(), {}, { "anchors.key": "something precious" });
+
+    expect(await run(["keygen", "--out", "anchors"], h.io)).toBe(EXIT_USAGE);
+    expect(h.written.has("anchors.key")).toBe(false);
+  });
+
+  it("needs somewhere to put the key rather than printing it", async () => {
+    const h = harness(new MemoryStore());
+    expect(await run(["keygen"], h.io)).toBe(EXIT_USAGE);
+    expect(h.err.join("\n")).toContain("--out");
+  });
+
+  it("does not need a database", async () => {
+    const out: string[] = [];
+    const err: string[] = [];
+    const written = new Map<string, string>();
+    const code = await run(["keygen", "--out", "k"], {
+      out: (line) => out.push(line),
+      err: (line) => err.push(line),
+      env: {},
+      createFile: async (path, data) => void written.set(path, data),
+    });
+    expect(code).toBe(EXIT_OK);
+    expect(err.join("\n")).not.toContain("DATABASE_URL");
+  });
+});
+
+describe("audit-log checkpoint --sign-key and verify --anchor-file", () => {
+  it("signs the head, and verify accepts it with the matching public key", async () => {
+    const tenant = tenantName();
+    const store = await seed(tenant, 3);
+    const key = generateSigningKey();
+    const h = harness(store, {}, { "a.key": key.privateKeyPem, "a.pub": key.publicKeyPem });
+
+    expect(await run(["checkpoint", "--tenant", tenant, "--sign-key", "a.key"], h.io)).toBe(EXIT_OK);
+    const line = h.out[0]!;
+    expect(decodeSignedAnchor(line).keyId).toBe(key.keyId);
+    expect(openSignedAnchor(decodeSignedAnchor(line), key.publicKeyPem).seq).toBe(3);
+
+    const check = harness(store, {}, { "anchor.json": line, "a.pub": key.publicKeyPem });
+    expect(
+      await run(
+        ["verify", "--tenant", tenant, "--anchor-file", "anchor.json", "--public-key", "a.pub"],
+        check.io,
+      ),
+    ).toBe(EXIT_OK);
+    expect(check.out[0]).toContain("ok  3 entries");
+  });
+
+  it("will not use a signed anchor without the key to check it", async () => {
+    const tenant = tenantName();
+    const h = harness(await seed(tenant, 2), {}, { "anchor.json": "{}" });
+
+    expect(await run(["verify", "--tenant", tenant, "--anchor-file", "anchor.json"], h.io)).toBe(
+      EXIT_USAGE,
+    );
+    expect(h.err.join("\n")).toContain("an unchecked signature is not evidence");
+  });
+
+  it("refuses a forged anchor instead of verifying against it", async () => {
+    const tenant = tenantName();
+    const store = await seed(tenant, 2);
+    const theirs = generateSigningKey();
+    const ours = generateSigningKey();
+
+    // Someone with their own key signing a position they chose.
+    const forging = harness(store, {}, { "theirs.key": theirs.privateKeyPem });
+    await run(["checkpoint", "--tenant", tenant, "--sign-key", "theirs.key"], forging.io);
+
+    const h = harness(store, {}, { "anchor.json": forging.out[0]!, "ours.pub": ours.publicKeyPem });
+    const code = await run(
+      ["verify", "--tenant", tenant, "--anchor-file", "anchor.json", "--public-key", "ours.pub"],
+      h.io,
+    );
+
+    // Not 0 — that would call a forgery proof. Not 1 either: nothing was checked
+    // against the chain, so the question was not answered.
+    expect(code).toBe(EXIT_USAGE);
+    expect(h.err.join("\n")).toContain(`signed by key ${theirs.keyId}`);
+    expect(h.out).toHaveLength(0);
+  });
+
+  it("catches a truncated export handed over with a signed anchor, without a database", async () => {
+    const tenant = tenantName();
+    const store = await seed(tenant, 5);
+    const key = generateSigningKey();
+
+    const taken = harness(store, {}, { "a.key": key.privateKeyPem });
+    await run(["checkpoint", "--tenant", tenant, "--sign-key", "a.key"], taken.io);
+    const anchor = taken.out[0]!;
+
+    const exported = harness(store);
+    await run(["export", "--tenant", tenant], exported.io);
+    const short = exported.out.slice(0, 3);
+
+    // The auditor has a file, an anchor and a public key. No credentials.
+    const auditor = harness(
+      new MemoryStore(),
+      { "chain.ndjson": short },
+      { "anchor.json": anchor, "a.pub": key.publicKeyPem },
+    );
+    const code = await run(
+      [
+        "verify",
+        "--file",
+        "chain.ndjson",
+        "--tenant",
+        tenant,
+        "--anchor-file",
+        "anchor.json",
+        "--public-key",
+        "a.pub",
+      ],
+      auditor.io,
+    );
+
+    expect(code).toBe(EXIT_BROKEN);
+    expect(auditor.out[0]).toContain("truncated");
+  });
+
+  it("refuses an anchor signed for another tenant", async () => {
+    const mine = tenantName();
+    const theirs = tenantName();
+    const key = generateSigningKey();
+    const store = await seed(theirs, 2);
+
+    const taken = harness(store, {}, { "a.key": key.privateKeyPem });
+    await run(["checkpoint", "--tenant", theirs, "--sign-key", "a.key"], taken.io);
+
+    const h = harness(await seed(mine, 2), {}, { "anchor.json": taken.out[0]!, "a.pub": key.publicKeyPem });
+    expect(
+      await run(
+        ["verify", "--tenant", mine, "--anchor-file", "anchor.json", "--public-key", "a.pub"],
+        h.io,
+      ),
+    ).toBe(EXIT_USAGE);
+    expect(h.err.join("\n")).toContain(`signed for tenant "${theirs}"`);
+  });
+
+  it("refuses two kinds of anchor at once, and a key with no anchor", async () => {
+    const tenant = tenantName();
+    const key = generateSigningKey();
+    const both = harness(await seed(tenant, 1), {}, { "a.pub": key.publicKeyPem, "anchor.json": "{}" });
+    expect(
+      await run(
+        [
+          "verify",
+          "--tenant",
+          tenant,
+          "--anchor",
+          `1:${"a".repeat(64)}`,
+          "--anchor-file",
+          "anchor.json",
+          "--public-key",
+          "a.pub",
+        ],
+        both.io,
+      ),
+    ).toBe(EXIT_USAGE);
+
+    const lonely = harness(await seed(tenant, 1), {}, { "a.pub": key.publicKeyPem });
+    expect(
+      await run(["verify", "--tenant", tenant, "--public-key", "a.pub"], lonely.io),
+    ).toBe(EXIT_USAGE);
+  });
+
+  it("reports a missing or mangled anchor file as a failure to answer", async () => {
+    const tenant = tenantName();
+    const key = generateSigningKey();
+
+    const missing = harness(await seed(tenant, 1), {}, { "a.pub": key.publicKeyPem });
+    expect(
+      await run(
+        ["verify", "--tenant", tenant, "--anchor-file", "gone.json", "--public-key", "a.pub"],
+        missing.io,
+      ),
+    ).toBe(EXIT_USAGE);
+
+    const mangled = harness(
+      await seed(tenant, 1),
+      {},
+      { "a.pub": key.publicKeyPem, "anchor.json": "half a {" },
+    );
+    expect(
+      await run(
+        ["verify", "--tenant", tenant, "--anchor-file", "anchor.json", "--public-key", "a.pub"],
+        mangled.io,
+      ),
+    ).toBe(EXIT_USAGE);
+  });
+
+  it("checks the anchor before it opens the database", async () => {
+    const key = generateSigningKey();
+    const out: string[] = [];
+    const err: string[] = [];
+    // No openStore hook and no DATABASE_URL. If the store were opened first, the
+    // answer would be about the connection rather than about the anchor, which is
+    // the thing the operator actually got wrong.
+    const code = await run(
+      ["verify", "--tenant", "acme", "--anchor-file", "anchor.json", "--public-key", "a.pub"],
+      {
+        out: (line) => out.push(line),
+        err: (line) => err.push(line),
+        env: {},
+        readFile: async (path) => (path === "a.pub" ? key.publicKeyPem : "half a {"),
+      },
+    );
+
+    expect(code).toBe(EXIT_USAGE);
+    expect(err.join("\n")).not.toContain("DATABASE_URL");
+  });
+
+  it("says which file it could not read when the signing key is missing", async () => {
+    const tenant = tenantName();
+    const h = harness(await seed(tenant, 1));
+    expect(await run(["checkpoint", "--tenant", tenant, "--sign-key", "gone.key"], h.io)).toBe(
+      EXIT_USAGE,
+    );
+    expect(h.err.join("\n")).toContain("gone.key");
   });
 });
 
