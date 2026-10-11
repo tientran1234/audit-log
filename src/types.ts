@@ -80,6 +80,27 @@ export interface Anchor {
   readonly hash: string;
 }
 
+/**
+ * An anchor plus a signature over it, made with a key the database does not hold.
+ * An unsigned anchor is only evidence if the verifier trusts whoever handed it
+ * over; this one stands on its own, so a truncated export cannot be passed off
+ * with an anchor made to match it.
+ *
+ * The anchor sits in a field instead of being spread across this interface so
+ * that a `SignedAnchor` is *not* assignable to {@link Anchor}: the only way to
+ * get one past the type system and into `verify()` is `openSignedAnchor`, which
+ * checks the signature first.
+ */
+export interface SignedAnchor {
+  readonly anchor: Anchor;
+  /** The signer's claim about when, covered by the signature. Not a trusted time. */
+  readonly signedAt: Date;
+  /** Which key signed. See `publicKeyId`. */
+  readonly keyId: string;
+  /** Base64. Hex would add 40 characters to a line meant to be pasted by hand. */
+  readonly signature: string;
+}
+
 export type BreakKind =
   /** The chain does not start at seq 1, or entry 1 does not link to genesis. */
   | "bad_genesis"
@@ -182,6 +203,18 @@ export class NonMonotonicTimeError extends Error {
       `${tenant}: cannot append at ${at.toISOString()}, the last entry is at ${tailAt.toISOString()}`,
     );
     this.name = "NonMonotonicTimeError";
+  }
+}
+
+/**
+ * A signed anchor that cannot be trusted: the wrong key, a signature that does
+ * not match, or a key that cannot be read. Distinct from a chain break, because
+ * it means the question was not answered rather than answered badly.
+ */
+export class AnchorSignatureError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AnchorSignatureError";
   }
 }
 

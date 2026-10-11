@@ -8,12 +8,13 @@ says it is intact or names the sequence number where it broke.
 The guarantee, stated so it can be tested: **within a tenant, entries are gapless
 and every hash covers the entry's own fields, its position and the hash before it;
 `verify()` reports the first break and what kind it is. With an anchor kept outside
-the database, a chain whose newest entries were deleted is caught too.**
+the database, a chain whose newest entries were deleted is caught too — and when
+that anchor is signed, an anchor made to match a shortened log is caught as well.**
 
 ## Usage
 
 ```ts
-import { AuditLog, PostgresStore, migrate } from "audit-log";
+import { AuditLog, PostgresStore, migrate, openSignedAnchor } from "audit-log";
 import { Pool } from "pg";
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
@@ -32,8 +33,14 @@ await log.append({
   payload: { reason: "duplicate" },
 });
 
-// Written down last month, outside this database. `log.head("acme")` produced it.
-const anchor = { tenant: "acme", seq: 3, hash: "e7db45dcdb1adbb4…" };
+// Last month's position, signed with a key this database's host does not hold, and
+// then written down somewhere this database cannot reach. `log.head("acme")` gives
+// you the same position unsigned, if you are the only one who has to believe it.
+const signed = await log.checkpoint("acme", { privateKeyPem });   // keep this
+// ...and, wherever the checking happens, with only the public key:
+const anchor = openSignedAnchor(signed!, publicKeyPem);
+// `openSignedAnchor` throws if the signature does not hold, so there is no path
+// from a signed anchor to a verification that did not check it.
 
 // A cron job, or a test in your release pipeline.
 const result = await log.verify("acme", { anchor });
@@ -56,6 +63,31 @@ acme  ok  3 entries  head 3:e7db45dcdb1adbb42779e7b7353b45f010769f2acd7ac3cfba35
 $ audit-log verify --all --json | jq -c 'select(.ok == false)'
 $ audit-log export --tenant acme > acme.ndjson    # hand this to an auditor
 $ audit-log verify --file acme.ndjson --tenant acme
+```
+
+A plain anchor is only evidence to someone who already trusts whoever handed it
+over. Sign it once and it stands on its own:
+
+```
+$ audit-log keygen --out anchors              # once; anchors.key never leaves the safe
+9f86d081884c7d65  anchors.key  anchors.pub
+
+$ audit-log checkpoint --tenant acme --sign-key anchors.key > acme.anchor
+$ cat acme.anchor
+{"v":"audit-log/anchor/v1","tenant":"acme","seq":3,"hash":"e7db45dc…","signedAt":"2026-06-02T10:00:00.000Z","keyId":"9f86d081884c7d65","sig":"Mu1k…=="}
+
+$ audit-log verify --file acme.ndjson --tenant acme \
+    --anchor-file acme.anchor --public-key anchors.pub
+acme  BROKEN at seq 6  truncated  the chain ends at seq 4, the anchor is at seq 6
+```
+
+An anchor the key did not sign is refused before any chain is read, so a shortened
+export cannot be handed over with an anchor built to match it:
+
+```
+$ audit-log verify --tenant acme --anchor-file forged.anchor --public-key anchors.pub; echo $?
+the anchor was signed by key 4c2b9f0ad1e37ac8, but the key supplied is 9f86d081884c7d65
+2
 ```
 
 Exit codes are the answer: 0 intact, 1 a chain is broken, 2 the question could not
@@ -138,6 +170,65 @@ fails if the chain no longer reaches it. There is a test asserting that verifica
 *without* an anchor accepts a truncated chain, so that nobody later claims a
 guarantee the hashes do not give.
 
+**Checkpoints are signed; entries are not.** An anchor is only evidence if the
+verifier trusts whoever handed it over — and the party best placed to hand an
+auditor a shortened export is the same party that would hand over an anchor
+matching it. A signature made with a key the database's host does not hold closes
+that, and it closes it where the cost is lowest: one signature per checkpoint, over
+four fields, taken as often as you take a checkpoint. Signing every entry would put
+the signing key on the append path and make the log's integrity depend on key
+management — the reason this README used to say signatures were out of scope, and
+still the reason per-entry signatures are. Ed25519 from `node:crypto`, keys as PKCS#8
+and SPKI PEM, so `openssl` and every secret store already handle them and this
+package stores no keys and adds no dependency.
+
+**A `SignedAnchor` is not an `Anchor`, structurally.** It holds its anchor in a
+field rather than spreading the three columns across itself, so it will not satisfy
+`verify({ anchor })` and there is no accidental path that uses a signed anchor
+without checking the signature. `openSignedAnchor` is the only function that turns
+one into an `Anchor`. `tests/signature.test.ts` pins this with a `@ts-expect-error`:
+flatten the type and `pnpm typecheck` fails. Reaching into `.anchor` deliberately
+still works — a type cannot stop that — but nothing here, and no flag on the CLI,
+does it. `--anchor-file` without `--public-key` is refused rather than treated as a
+plain anchor, because an unchecked signature is not weaker evidence than no
+signature, it is the same evidence wearing something that looks like proof.
+
+**A bad signature is exit 2, not exit 1.** The exit codes already mean 0 intact,
+1 a chain is broken, 2 the question could not be answered. A forged anchor, the
+wrong key file and a reflowed line are indistinguishable from outside, and in all
+three cases nothing was checked against the chain — so the honest answer is the
+third one. Exit 1 would make a mistyped filename look like tampering; exit 0 would
+make a forgery look like proof.
+
+**`signedAt` is in the signature but is not a trusted time.** The signer supplies
+it, as they supply an entry's `at`; there is no timestamp authority here. It is
+covered so that two checkpoints at one position stay distinguishable and so a
+verifier holding several anchors can tell which is which. What it does not do is
+prove a chain's *current* length: an old signed anchor is still valid, and proves
+only that the chain once reached that point. Verify against the newest anchor you
+hold, not the one you were handed.
+
+**The key id is 64 bits of the public key's fingerprint, and authenticates
+nothing.** It says *which* key, so a verifier holding several can pick one and a
+mismatch gets a message naming both keys instead of "bad signature". Truncating it
+is safe precisely because the signature, not the identifier, is what has to hold —
+a wrong key fails the signature whatever its id says.
+
+**`keygen` creates key files with `O_EXCL` and refuses to overwrite.** Overwriting
+a signing key silently turns every anchor ever made with it into one nobody can
+verify, and there is no way back from that; refusing and making the operator pick
+another path is recoverable. The private key is created mode `0600`. A
+check-then-write would leave a window, so the exclusive create is the check.
+
+**The signature covers a length-prefixed preimage, like the entry hash.** Today
+every field after the tenant has a constrained alphabet — digits, lowercase hex, a
+fixed-width timestamp — so a joined preimage would happen to be unambiguous too.
+Framing means that stays true if a field is ever added, and that there is one
+encoding rule in this package rather than two. The domain tag `audit-log/anchor/v1`
+is the first frame, so an anchor signature cannot be replayed as anything else here
+hashes, and an anchor from a future field list is refused as a version mismatch
+rather than reported as a forgery.
+
 **The export embeds the payload as JSON, not as the canonical string.** An auditor
 has to read the file, and `"{\"amount\":100}"` is not reading material. Decoding
 re-derives the canonical form, which is a function of the value, so a tool that
@@ -165,9 +256,10 @@ audit-log/
     types.ts              vocabulary, the SealedEntry brand, the store interface
     canonical.ts          canonical JSON, and the length-prefixed framing
     chain.ts              the hash preimage, seal(), and the streaming verifier
-    log.ts                AuditLog: append, verify, head, stream
+    signature.ts          ed25519 checkpoint signatures, and their one-line wire form
+    log.ts                AuditLog: append, verify, head, checkpoint, stream
     wire.ts               the NDJSON export format and the anchor format
-    cli.ts                verify / checkpoint / export / migrate
+    cli.ts                verify / checkpoint / keygen / export / migrate
     store/
       memory.ts           the same guarantees in one process, for tests
       postgres.ts         the durable store
@@ -182,11 +274,22 @@ audit-log/
   verification and export need. "Everything user:42 did last March" is a projection
   built from these rows, with its own indexes and its own idea of what is worth
   filtering on; putting it here would mean guessing that for everyone.
-- **No signatures and no external timestamp authority.** The chain proves that
-  entries were not changed after they were written. It does not prove *who* wrote
-  them or *when* in wall-clock terms — the writer supplies both. Signing entries
-  needs key management, and trustworthy times need a third party; either is a larger
-  project than this one.
+- **No per-entry signatures, and no external timestamp authority.** Checkpoints are
+  signed; entries are not. A signature per entry would put the signing key on the
+  append path, and the log's integrity would then rest on key management — rotation,
+  custody, what to do with entries signed by a retired key — which is a larger
+  project than this one. So the chain still does not prove *who* wrote an entry: the
+  writer supplies the actor, and a signed checkpoint vouches for the position, not
+  for the contents of any one row. Nor is there a trusted time anywhere here.
+  `recordedAt` comes from the database clock and `signedAt` from the signer's; both
+  are claims. A verifiable wall-clock time needs a third party, and this package
+  does not reach outside your database for one.
+- **No key management.** `keygen` writes two PEM files and that is the whole of it.
+  There is no key store, no rotation, no revocation list, no expiry, and anchors do
+  not chain to one another — so a compromised key is handled by generating another
+  one and taking a fresh checkpoint, while old anchors signed by the old key simply
+  stop being checked. Anything better than that is a secret store's job, and PEM is
+  what secret stores already take.
 - **No Merkle tree.** A linear chain verifies in one pass and explains a break in one
   sentence. A tree buys short inclusion proofs for a single entry, which matters when
   a third party verifies one record without seeing the log — a transparency-log
@@ -212,8 +315,8 @@ audit-log/
 
 ```
 pnpm install
-pnpm test                                   # 118 tests; Postgres suite skipped
-DATABASE_URL=postgres://… pnpm test         # 141 tests
+pnpm test                                   # 167 tests; Postgres suite skipped
+DATABASE_URL=postgres://… pnpm test         # 190 tests
 ```
 
 The suite is written so that removing a guarantee breaks it. Verified by mutation:
@@ -222,5 +325,9 @@ replacing the length-prefixed framing with a `":"` join, dropping the key sort f
 `prevHash` link check, the `seq` gap check or the unreached-anchor check in
 `verifyChain`, allowing an entry timed before the tail, dropping `primary key
 (tenant, seq)` or the append-only trigger from the schema, and removing the
-append retry each fail at least one test. Dropping the `SealedEntry` brand fails
-`pnpm typecheck` instead.
+append retry each fail at least one test. So does dropping any one of the four
+signed fields — tenant, seq, hash, `signedAt` — from a checkpoint's preimage,
+dropping the key-id check, the millisecond-precision check or the base64
+canonicality check when decoding an anchor, or letting `--anchor-file` be used
+without `--public-key`. Dropping the `SealedEntry` brand fails `pnpm typecheck`
+instead, as does flattening `SignedAnchor` into an `Anchor`.

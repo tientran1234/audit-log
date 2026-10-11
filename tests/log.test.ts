@@ -3,6 +3,7 @@ import { AuditLog } from "../src/log.js";
 import { MemoryStore } from "../src/store/memory.js";
 import { GENESIS_HASH } from "../src/chain.js";
 import { InvalidPayloadError, MalformedEntryError, type SealedEntry } from "../src/types.js";
+import { generateSigningKey, openSignedAnchor } from "../src/signature.js";
 import { at, memoryLog, tenantName } from "./helpers.js";
 
 const event = (overrides: Record<string, unknown> = {}) => ({
@@ -146,5 +147,50 @@ describe("the seal is a compile-time boundary", () => {
       hash: real.hash,
     };
     expect(forged.actor).toBe("somebody else");
+  });
+});
+
+describe("log.checkpoint", () => {
+  it("signs the head, and the signature opens to the position verify needs", async () => {
+    const log = memoryLog();
+    const tenant = tenantName();
+    for (let i = 0; i < 3; i += 1) {
+      await log.append(event({ tenant, resource: `r:${i}`, at: at(i) }));
+    }
+    const key = generateSigningKey();
+
+    const signed = await log.checkpoint(tenant, { privateKeyPem: key.privateKeyPem });
+    expect(signed).toBeDefined();
+    const anchor = openSignedAnchor(signed!, key.publicKeyPem);
+
+    expect(anchor).toEqual(await log.head(tenant));
+    expect((await log.verify(tenant, { anchor })).ok).toBe(true);
+  });
+
+  it("has nothing to sign for an empty chain", async () => {
+    const key = generateSigningKey();
+    const signed = await memoryLog().checkpoint(tenantName(), { privateKeyPem: key.privateKeyPem });
+    // Not an anchor at seq 0: "this log is empty" is the one claim a signature
+    // cannot support, because an emptied log looks exactly like a new one.
+    expect(signed).toBeUndefined();
+  });
+
+  it("takes the caller's time when one is given", async () => {
+    const log = memoryLog();
+    const tenant = tenantName();
+    await log.append(event({ tenant, at: at(0) }));
+    const key = generateSigningKey();
+    const when = new Date("2026-07-01T00:00:00.000Z");
+
+    const signed = await log.checkpoint(tenant, { privateKeyPem: key.privateKeyPem, signedAt: when });
+    expect(signed?.signedAt).toEqual(when);
+    expect(openSignedAnchor(signed!, key.publicKeyPem).seq).toBe(1);
+  });
+
+  it("rejects an empty tenant like every other method", async () => {
+    const key = generateSigningKey();
+    await expect(memoryLog().checkpoint("", { privateKeyPem: key.privateKeyPem })).rejects.toThrow(
+      MalformedEntryError,
+    );
   });
 });
