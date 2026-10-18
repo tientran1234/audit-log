@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { GENESIS_HASH, entryHash, isHash, seal, verifyChain } from "../src/chain.js";
 import { canonicalJson } from "../src/canonical.js";
-import type { AuditEntry, SealedEntry } from "../src/types.js";
+import { AnchorConflictError, type AuditEntry, type SealedEntry } from "../src/types.js";
 import { at, chain, draft, edit, reseal, tenantName } from "./helpers.js";
 
 /** Every break test is the same shape: hand `verifyChain` a chain and read the verdict. */
@@ -347,6 +347,97 @@ describe("verifyChain", () => {
       const entries = chain("a", 1);
       await expect(
         verifyChain("a", entries, { anchor: { tenant: "b", seq: 1, hash: entries[0]!.hash } }),
+      ).rejects.toThrow(/anchor is for tenant "b"/);
+    });
+  });
+
+  describe("a journal's worth of anchors", () => {
+    /** The original chain, and the same positions rewritten from `from` onwards. */
+    function rewriteFrom(tenant: string, length: number, from: number) {
+      const original = chain(tenant, length);
+      const rewritten: SealedEntry[] = [...original.slice(0, from - 1)];
+      for (let seq = from; seq <= length; seq += 1) {
+        rewritten.push(
+          seal({
+            tenant,
+            seq,
+            prevHash: rewritten.at(-1)?.hash ?? GENESIS_HASH,
+            recordedAt: at(seq),
+            draft: draft({ action: "invoice.approve" }),
+          }),
+        );
+      }
+      return { original, rewritten };
+    }
+
+    it("reports the oldest anchor the chain no longer matches, not the newest", async () => {
+      const tenant = tenantName();
+      const { original, rewritten } = rewriteFrom(tenant, 5, 2);
+      const anchors = [2, 4].map((seq) => ({ tenant, seq, hash: original[seq - 1]!.hash }));
+
+      const result = await verifyChain(tenant, rewritten, { anchors });
+      expect(result.ok).toBe(false);
+      // Every anchor at or below an entry is settled as the walk passes it, so the
+      // break names the earliest position that diverged. Checking only the newest
+      // anchor would report seq 4 and hide how far back the rewrite reaches.
+      if (!result.ok) expect(result.break).toMatchObject({ kind: "anchor_mismatch", seq: 2 });
+    });
+
+    it("reports the lowest anchor a truncated chain fails to reach", async () => {
+      const tenant = tenantName();
+      const entries = chain(tenant, 5);
+      const anchors = [3, 5].map((seq) => ({ tenant, seq, hash: entries[seq - 1]!.hash }));
+
+      const result = await verifyChain(tenant, entries.slice(0, 2), { anchors });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.break).toMatchObject({ kind: "truncated", seq: 3 });
+    });
+
+    it("accepts a chain that reaches every anchor in the journal", async () => {
+      const tenant = tenantName();
+      const entries = chain(tenant, 4);
+      const anchors = [1, 2, 4].map((seq) => ({ tenant, seq, hash: entries[seq - 1]!.hash }));
+      expect((await verifyChain(tenant, entries, { anchors })).ok).toBe(true);
+    });
+
+    it("merges a single --anchor with the journal's anchors", async () => {
+      const tenant = tenantName();
+      const entries = chain(tenant, 5);
+      const result = await verifyChain(tenant, entries.slice(0, 4), {
+        anchor: { tenant, seq: 5, hash: entries[4]!.hash },
+        anchors: [{ tenant, seq: 2, hash: entries[1]!.hash }],
+      });
+      // The journal's anchor is satisfied; the one passed by hand is not.
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.break).toMatchObject({ kind: "truncated", seq: 5 });
+    });
+
+    it("tolerates the same position anchored twice", async () => {
+      const tenant = tenantName();
+      const entries = chain(tenant, 2);
+      const anchor = { tenant, seq: 2, hash: entries[1]!.hash };
+      expect((await verifyChain(tenant, entries, { anchors: [anchor, anchor] })).ok).toBe(true);
+    });
+
+    it("refuses two anchors that disagree about one position", async () => {
+      const tenant = tenantName();
+      const { original, rewritten } = rewriteFrom(tenant, 3, 2);
+      // No chain can satisfy both, so there is no verdict to give about the
+      // entries — the pair of anchors is itself the finding.
+      await expect(
+        verifyChain(tenant, rewritten, {
+          anchors: [
+            { tenant, seq: 3, hash: original[2]!.hash },
+            { tenant, seq: 3, hash: rewritten[2]!.hash },
+          ],
+        }),
+      ).rejects.toThrow(AnchorConflictError);
+    });
+
+    it("refuses a journal anchor belonging to another tenant", async () => {
+      const entries = chain("a", 1);
+      await expect(
+        verifyChain("a", entries, { anchors: [{ tenant: "b", seq: 1, hash: entries[0]!.hash }] }),
       ).rejects.toThrow(/anchor is for tenant "b"/);
     });
   });

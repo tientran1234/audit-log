@@ -9,11 +9,21 @@
  *
  * `seal()` is deliberately not exported: a `SealedEntry` can only be produced
  * inside this package, so no caller can hand a store a hash of its own choosing.
+ *
+ * Anchors are kept in a journal — a file outside the database that `checkpoint`
+ * appends to and `verify` checks every line of. See `journal.ts`.
  */
 
 export { AuditLog, type AuditLogOptions } from "./log.js";
 export { canonicalJson, parsePayload } from "./canonical.js";
 export { GENESIS_HASH, entryHash, isHash, verifyChain, type VerifyOptions } from "./chain.js";
+export {
+  decodeAnchorRecord,
+  decodeAnchorRecords,
+  encodeAnchorRecord,
+  readJournal,
+  type Journal,
+} from "./journal.js";
 export {
   decodeEntries,
   decodeEntry,
@@ -31,10 +41,12 @@ export {
   type PostgresStoreOptions,
 } from "./store/postgres.js";
 export {
+  AnchorConflictError,
   InvalidPayloadError,
   MalformedEntryError,
   NonMonotonicTimeError,
   type Anchor,
+  type AnchorRecord,
   type AuditEntry,
   type AuditInput,
   type AuditStore,

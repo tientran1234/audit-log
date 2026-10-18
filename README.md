@@ -7,8 +7,10 @@ says it is intact or names the sequence number where it broke.
 
 The guarantee, stated so it can be tested: **within a tenant, entries are gapless
 and every hash covers the entry's own fields, its position and the hash before it;
-`verify()` reports the first break and what kind it is. With an anchor kept outside
-the database, a chain whose newest entries were deleted is caught too.**
+`verify()` reports the first break and what kind it is. With anchors kept outside
+the database — a journal file `checkpoint` appends to and `verify` checks every line
+of — a chain whose newest entries were deleted, or that has vanished entirely, is
+caught too.**
 
 ## Usage
 
@@ -56,6 +58,31 @@ acme  ok  3 entries  head 3:e7db45dcdb1adbb42779e7b7353b45f010769f2acd7ac3cfba35
 $ audit-log verify --all --json | jq -c 'select(.ok == false)'
 $ audit-log export --tenant acme > acme.ndjson    # hand this to an auditor
 $ audit-log verify --file acme.ndjson --tenant acme
+```
+
+An anchor is only worth anything if something keeps it, and a hash pasted into a
+ticket is not something. `--journal` is: one NDJSON line per checkpoint, in a file
+you put somewhere this database cannot reach.
+
+```
+$ audit-log checkpoint --all --journal anchors.ndjson    # nightly, in cron
+acme  7:e7db45dcdb1adbb42779e7b7353b45f010769f2acd7ac3cfba35a71b0b27ab89
+$ cat anchors.ndjson
+{"tenant":"acme","seq":3,"hash":"e7db45dc…","observedAt":"2026-09-18T02:00:00.000Z"}
+{"tenant":"acme","seq":7,"hash":"a1c90f4b…","observedAt":"2026-10-11T02:00:00.000Z"}
+
+$ audit-log verify --all --journal anchors.ndjson; echo $?
+acme  ok  7 entries  head 7:a1c90f4b…
+0
+```
+
+Because the file names its tenants, this also answers the question a bare `--all`
+cannot: a chain that is gone is not in the database to be listed.
+
+```
+$ audit-log verify --all --journal anchors.ndjson; echo $?
+acme  BROKEN at seq 3  truncated  the chain is empty, the anchor is at seq 3  (anchored 2026-09-18T02:00:00.000Z)
+1
 ```
 
 Exit codes are the answer: 0 intact, 1 a chain is broken, 2 the question could not
@@ -138,6 +165,43 @@ fails if the chain no longer reaches it. There is a test asserting that verifica
 *without* an anchor accepts a truncated chain, so that nobody later claims a
 guarantee the hashes do not give.
 
+**The journal is a file you name, and nothing else.** `--journal` appends to a
+path and reads it back; it does not commit it, ship it anywhere or sign it, and it
+will write happily next to the database it is supposed to outlive. Where the file
+goes is the decision that makes an anchor an anchor, and it depends on who in your
+setup can edit what: a cron job committing to a repository the database user cannot
+push to is a different answer from a bucket with object lock, and both beat a file
+on the database host. The one choice that is always wrong — anchors inside the
+audited database, vouched for by whoever can rewrite it — is the one thing this
+cannot be told to do.
+
+**Every line is kept, and every line is checked.** A linear chain means the newest
+anchor already covers all of the history before it, so a journal is not about
+catching more. It is about what happens after a break: whoever rewrote the table
+can run `checkpoint` too, and the anchor they produce agrees with the chain they
+wrote. The older lines in the same file do not, so the rewrite cannot be laundered
+by anchoring it. Checking all of them also decides *which* seq gets reported —
+`verifyChain` walks the anchors alongside the entries and names the oldest one the
+chain stopped matching, which with the `observedAt` of the newest anchor that still
+holds brackets the damage in wall-clock time. `observedAt` is the clock of whoever
+ran `checkpoint` and is no more trustworthy than the rest of the file; it is still
+the only thing that says *when*.
+
+**`checkpoint --journal` verifies before it appends, and refuses if the chain is
+broken.** Otherwise the first cron run after a break adds a line that agrees with
+the break, and the next operator opens a file that contradicts itself with no way
+to tell which line to trust. It costs a full chain walk per checkpoint, which is
+the price of a journal that only ever grew by lines that were true when written;
+plain `checkpoint` still just reads the head. An unchanged position is not
+re-recorded either — a quiet tenant would otherwise collect a line a day, and the
+journal records positions, not runs.
+
+**Two anchors for one position exit 1, not 2.** Exit 2 means the question could not
+be answered, and this one was: whichever line is right, something wrote a chain
+this file has already seen another version of. `readJournal` reports it before the
+database is even opened, which is also the only check here that works on a stolen
+copy of the journal alone.
+
 **The export embeds the payload as JSON, not as the canonical string.** An auditor
 has to read the file, and `"{\"amount\":100}"` is not reading material. Decoding
 re-derives the canonical form, which is a function of the value, so a tool that
@@ -167,6 +231,7 @@ audit-log/
     chain.ts              the hash preimage, seal(), and the streaming verifier
     log.ts                AuditLog: append, verify, head, stream
     wire.ts               the NDJSON export format and the anchor format
+    journal.ts            the anchor journal: a file of anchors, checked against itself
     cli.ts                verify / checkpoint / export / migrate
     store/
       memory.ts           the same guarantees in one process, for tests
@@ -195,9 +260,11 @@ audit-log/
   you delete from it. Trimming an audit log means breaking its chain on purpose, so
   it needs a decision — a sealed archive of the removed prefix, a new genesis — that
   this package should not make for you.
-- **No automatic anchoring.** `checkpoint` prints an anchor; where it goes is yours.
-  Writing it back into the same database would anchor the chain to something the same
-  writer can edit, which is no anchor at all.
+- **No anchoring to anywhere but a file.** `--journal` appends to a path and that is
+  the end of it: no commit, no upload, no signature, no scheduler. Those are decisions
+  about who in your organisation can edit what, and getting them wrong quietly — an
+  anchor on the host whose database it vouches for — is worse than having no journal
+  at all, because it looks like one.
 - **No HTTP endpoint and no UI.** `verify` is an exit code and a line of text,
   which is what a cron job and a pipeline want. Wrapping it in a status page is
   three lines in whatever framework you already have.
@@ -212,8 +279,8 @@ audit-log/
 
 ```
 pnpm install
-pnpm test                                   # 118 tests; Postgres suite skipped
-DATABASE_URL=postgres://… pnpm test         # 141 tests
+pnpm test                                   # 150 tests; Postgres suite skipped
+DATABASE_URL=postgres://… pnpm test         # 173 tests
 ```
 
 The suite is written so that removing a guarantee breaks it. Verified by mutation:
@@ -221,6 +288,10 @@ replacing the length-prefixed framing with a `":"` join, dropping the key sort f
 `canonicalJson`, letting it accept `Date`s, skipping the hash recomputation, the
 `prevHash` link check, the `seq` gap check or the unreached-anchor check in
 `verifyChain`, allowing an entry timed before the tail, dropping `primary key
-(tenant, seq)` or the append-only trigger from the schema, and removing the
-append retry each fail at least one test. Dropping the `SealedEntry` brand fails
+(tenant, seq)` or the append-only trigger from the schema, removing the
+append retry, checking only the newest anchor instead of every one, reporting the
+highest unreached anchor instead of the lowest, accepting a journal that
+contradicts itself, letting `checkpoint --journal` anchor a broken chain, leaving
+journal-only tenants out of `verify --all`, and re-recording an unchanged position
+each fail at least one test. Dropping the `SealedEntry` brand fails
 `pnpm typecheck` instead.

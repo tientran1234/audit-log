@@ -80,6 +80,16 @@ export interface Anchor {
   readonly hash: string;
 }
 
+/**
+ * An anchor as it is written to a journal: the position, plus the clock of
+ * whoever recorded it. That time is not trusted — the same writer who can
+ * rewrite the table can write a line here — but it is what brackets a rewrite
+ * between two anchors when one of them stops matching.
+ */
+export interface AnchorRecord extends Anchor {
+  readonly observedAt: Date;
+}
+
 export type BreakKind =
   /** The chain does not start at seq 1, or entry 1 does not link to genesis. */
   | "bad_genesis"
@@ -182,6 +192,24 @@ export class NonMonotonicTimeError extends Error {
       `${tenant}: cannot append at ${at.toISOString()}, the last entry is at ${tailAt.toISOString()}`,
     );
     this.name = "NonMonotonicTimeError";
+  }
+}
+
+/**
+ * Two anchors claim different hashes for the same position. One of them was not
+ * produced by the chain being verified, and the pair says so without the
+ * database being reachable at all — which is why it is an error about the
+ * anchors rather than a {@link ChainBreak} about the chain.
+ */
+export class AnchorConflictError extends Error {
+  constructor(
+    readonly tenant: string,
+    readonly seq: number,
+    readonly first: string,
+    readonly second: string,
+  ) {
+    super(`${tenant}: two anchors disagree about seq ${seq}: ${first} and ${second}`);
+    this.name = "AnchorConflictError";
   }
 }
 
