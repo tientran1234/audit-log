@@ -10,14 +10,23 @@
  */
 
 import { createReadStream } from "node:fs";
+import { appendFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { AuditLog } from "./log.js";
 import { PostgresStore, type PgPool } from "./store/postgres.js";
-import { verifyChain } from "./chain.js";
+import { verifyChain, type VerifyOptions } from "./chain.js";
+import { encodeAnchorRecord, readJournal, type Journal } from "./journal.js";
 import { decodeEntries, encodeEntry, formatAnchor, parseAnchor } from "./wire.js";
-import type { Anchor, AuditStore, VerificationResult } from "./types.js";
+import {
+  AnchorConflictError,
+  type Anchor,
+  type AnchorRecord,
+  type AuditStore,
+  type ChainBreak,
+  type VerificationResult,
+} from "./types.js";
 
 export const EXIT_OK = 0;
 export const EXIT_BROKEN = 1;
@@ -31,6 +40,10 @@ export interface CliIo {
   readonly openStore?: () => Promise<AuditStore>;
   /** Overridden in tests; by default the lines of a file on disk. */
   readonly readLines?: (path: string) => AsyncIterable<string>;
+  /** Overridden in tests; by default appends lines to a file on disk. */
+  readonly appendLines?: (path: string, lines: readonly string[]) => Promise<void>;
+  /** Overridden in tests; the time written into a journal record. */
+  readonly now?: () => Date;
 }
 
 /** A failure that is the operator's to fix, and so gets a message, not a stack. */
@@ -38,10 +51,10 @@ class CliError extends Error {}
 
 const USAGE = `audit-log — verify a hash-chained audit log
 
-  audit-log verify --tenant <t> [--anchor <seq:hash>] [--json]
-  audit-log verify --all [--json]
+  audit-log verify --tenant <t> [--anchor <seq:hash>] [--journal <file>] [--json]
+  audit-log verify --all [--journal <file>] [--json]
   audit-log verify --file <export.ndjson> --tenant <t> [--anchor <seq:hash>] [--json]
-  audit-log checkpoint --tenant <t> [--json]
+  audit-log checkpoint (--tenant <t> | --all) [--journal <file>] [--json]
   audit-log export --tenant <t>
   audit-log migrate
 
@@ -50,6 +63,13 @@ Database commands read DATABASE_URL and need the optional peer dependency "pg".
 An anchor is a position you wrote down somewhere this database cannot reach, as
 "<seq>:<hash>" — "checkpoint" prints one. Without it, verification cannot tell a
 log that was never longer from one whose newest entries were deleted.
+
+--journal <file> is that somewhere, as a file: "checkpoint --journal" appends one
+NDJSON line per tenant, "verify --journal" checks every line in it. Keep the file
+where this database cannot reach it — commit it, ship it to another host — or it
+anchors the chain to something its own writer can edit. Every line is checked, so
+"verify --all --journal" also reports a tenant that has vanished from the
+database entirely, and a checkpoint taken after a rewrite cannot hide it.
 
 Exit codes: 0 intact, 1 a chain is broken, 2 the question could not be answered.`;
 
@@ -63,6 +83,7 @@ export async function run(argv: readonly string[], io: CliIo): Promise<number> {
         tenant: { type: "string" },
         anchor: { type: "string" },
         file: { type: "string" },
+        journal: { type: "string" },
         all: { type: "boolean" },
         json: { type: "boolean" },
         help: { type: "boolean", short: "h" },
@@ -99,6 +120,11 @@ export async function run(argv: readonly string[], io: CliIo): Promise<number> {
         throw new CliError(`unknown command "${command}"`);
     }
   } catch (error) {
+    if (error instanceof AnchorConflictError) {
+      // Not "could not tell": two anchors for one position is itself the finding.
+      io.err(error.message);
+      return EXIT_BROKEN;
+    }
     if (error instanceof CliError) {
       io.err(error.message);
       return EXIT_USAGE;
@@ -114,16 +140,20 @@ type Values = {
   tenant?: string | undefined;
   anchor?: string | undefined;
   file?: string | undefined;
+  journal?: string | undefined;
   all?: boolean | undefined;
   json?: boolean | undefined;
 };
 
 async function verifyCommand(values: Values, io: CliIo): Promise<number> {
+  const journal = await openJournal(values.journal, io);
+
   if (values.file !== undefined) {
     const tenant = requireTenant(values);
     const lines = (io.readLines ?? fileLines)(values.file);
-    const result = await verifyChain(tenant, decodeEntries(lines), anchorOptions(tenant, values));
-    report(result, io, values.json === true);
+    const opts = anchorOptions(tenant, values, journal);
+    const result = await verifyChain(tenant, decodeEntries(lines), opts);
+    report(result, io, values.json === true, journal);
     return result.ok ? EXIT_OK : EXIT_BROKEN;
   }
 
@@ -133,26 +163,29 @@ async function verifyCommand(values: Values, io: CliIo): Promise<number> {
     if (values.all === true) {
       if (values.anchor !== undefined) {
         // One anchor cannot vouch for several chains, and silently applying it to
-        // the wrong one would be worse than refusing.
+        // the wrong one would be worse than refusing. A journal names its tenants.
         throw new CliError("--anchor names one tenant's position; use it with --tenant");
       }
-      const tenants = await log.tenants();
+      // A tenant the journal has an anchor for but the database has no rows for
+      // is the case a bare --all cannot see: the whole chain is gone, so it is
+      // not in `tenants()` and nothing would look for it.
+      const tenants = [...new Set([...(await log.tenants()), ...(journal?.tenants ?? [])])].sort();
       if (tenants.length === 0) {
         io.err("no tenants have any entries");
         return EXIT_OK;
       }
       let worst = EXIT_OK;
       for (const tenant of tenants) {
-        const result = await log.verify(tenant);
-        report(result, io, values.json === true);
+        const result = await log.verify(tenant, anchorOptions(tenant, values, journal));
+        report(result, io, values.json === true, journal);
         if (!result.ok) worst = EXIT_BROKEN;
       }
       return worst;
     }
 
     const tenant = requireTenant(values);
-    const result = await log.verify(tenant, anchorOptions(tenant, values));
-    report(result, io, values.json === true);
+    const result = await log.verify(tenant, anchorOptions(tenant, values, journal));
+    report(result, io, values.json === true, journal);
     return result.ok ? EXIT_OK : EXIT_BROKEN;
   } finally {
     await store.close();
@@ -160,17 +193,69 @@ async function verifyCommand(values: Values, io: CliIo): Promise<number> {
 }
 
 async function checkpointCommand(values: Values, io: CliIo): Promise<number> {
-  const tenant = requireTenant(values);
   const store = await openStore(io);
   const log = new AuditLog({ store });
   try {
-    const head = await log.head(tenant);
-    if (head === undefined) {
-      io.err(`${tenant} has no entries`);
+    const tenants = values.all === true ? await log.tenants() : [requireTenant(values)];
+    if (values.all === true && tenants.length === 0) {
+      io.err("no tenants have any entries");
       return EXIT_OK;
     }
-    io.out(values.json === true ? JSON.stringify(head) : formatAnchor(head));
-    return EXIT_OK;
+
+    const path = values.journal;
+    // Missing is the normal state before the first checkpoint, and an unreadable
+    // or self-contradicting journal still has to stop the run.
+    const journal = path === undefined ? undefined : await openJournal(path, io, { orEmpty: true });
+
+    const observedAt = (io.now ?? (() => new Date()))();
+    const anchored: Anchor[] = [];
+    const append: AnchorRecord[] = [];
+    let worst = EXIT_OK;
+
+    for (const tenant of tenants) {
+      const head = await log.head(tenant);
+      if (head === undefined) {
+        io.err(`${tenant} has no entries`);
+        continue;
+      }
+
+      if (journal !== undefined) {
+        // Anchoring a chain that no longer matches its own journal would add a
+        // line agreeing with the break, leaving the next operator a file that
+        // contradicts itself and no way to tell which line to trust.
+        const result = await log.verify(tenant, { anchors: journal.anchorsFor(tenant) });
+        if (!result.ok) {
+          report(result, io, values.json === true, journal);
+          io.err(`${tenant}: not anchored, the chain does not verify`);
+          worst = EXIT_BROKEN;
+          continue;
+        }
+        const newest = journal.anchorsFor(tenant).at(-1);
+        const unchanged =
+          newest !== undefined && newest.seq === head.seq && newest.hash === head.hash;
+        // A tenant with no new entries since the last checkpoint would otherwise
+        // get an identical line a day. The journal records positions, not runs.
+        if (!unchanged) append.push({ ...head, observedAt });
+      }
+
+      anchored.push(head);
+    }
+
+    // Written before anything is printed: stdout should not claim an anchor that
+    // did not reach the file.
+    if (path !== undefined && append.length > 0) {
+      await appendAnchors(path, append, io);
+    }
+    for (const head of anchored) {
+      io.out(
+        values.json === true
+          ? JSON.stringify(head)
+          : values.all === true
+            ? `${head.tenant}  ${formatAnchor(head)}`
+            : formatAnchor(head),
+      );
+    }
+    return worst;
   } finally {
     await store.close();
   }
@@ -204,7 +289,12 @@ async function migrateCommand(io: CliIo): Promise<number> {
   }
 }
 
-function report(result: VerificationResult, io: CliIo, json: boolean): void {
+function report(
+  result: VerificationResult,
+  io: CliIo,
+  json: boolean,
+  journal?: Journal | undefined,
+): void {
   if (json) {
     io.out(JSON.stringify(result));
     return;
@@ -215,8 +305,22 @@ function report(result: VerificationResult, io: CliIo, json: boolean): void {
     return;
   }
   io.out(
-    `${result.tenant}  BROKEN at seq ${result.break.seq}  ${result.break.kind}  ${result.break.detail}`,
+    `${result.tenant}  BROKEN at seq ${result.break.seq}  ${result.break.kind}  ${
+      result.break.detail
+    }${anchorNote(result.tenant, result.break, journal)}`,
   );
+}
+
+/**
+ * When the break is about an anchor, when that anchor was recorded. It brackets
+ * the damage: everything up to that line verified at that time, so whatever
+ * happened to the chain happened after it.
+ */
+function anchorNote(tenant: string, broken: ChainBreak, journal: Journal | undefined): string {
+  if (journal === undefined) return "";
+  if (broken.kind !== "anchor_mismatch" && broken.kind !== "truncated") return "";
+  const record = journal.recordAt(tenant, broken.seq);
+  return record === undefined ? "" : `  (anchored ${record.observedAt.toISOString()})`;
 }
 
 function requireTenant(values: Values): string {
@@ -226,8 +330,48 @@ function requireTenant(values: Values): string {
   return values.tenant;
 }
 
-function anchorOptions(tenant: string, values: Values): { anchor?: Anchor } {
-  return values.anchor === undefined ? {} : { anchor: parseAnchor(tenant, values.anchor) };
+function anchorOptions(
+  tenant: string,
+  values: Values,
+  journal: Journal | undefined,
+): VerifyOptions {
+  const anchors = journal?.anchorsFor(tenant) ?? [];
+  const one = values.anchor === undefined ? undefined : parseAnchor(tenant, values.anchor);
+  if (one === undefined) return anchors.length === 0 ? {} : { anchors };
+  return anchors.length === 0 ? { anchor: one } : { anchor: one, anchors };
+}
+
+async function openJournal(
+  path: string | undefined,
+  io: CliIo,
+  opts: { readonly orEmpty?: boolean } = {},
+): Promise<Journal | undefined> {
+  if (path === undefined) return undefined;
+  try {
+    return await readJournal((io.readLines ?? fileLines)(path));
+  } catch (error) {
+    if (opts.orEmpty === true && isMissing(error)) return readJournal([]);
+    throw error;
+  }
+}
+
+function isMissing(error: unknown): boolean {
+  return error instanceof Error && (error as { code?: unknown }).code === "ENOENT";
+}
+
+async function appendAnchors(
+  path: string,
+  records: readonly AnchorRecord[],
+  io: CliIo,
+): Promise<void> {
+  const lines = records.map(encodeAnchorRecord);
+  if (io.appendLines !== undefined) {
+    await io.appendLines(path, lines);
+    return;
+  }
+  // Append, never rewrite: the whole value of the file is that its old lines
+  // stay as they were. "a" also creates it on the first checkpoint.
+  await appendFile(path, lines.map((line) => `${line}\n`).join(""), "utf8");
 }
 
 async function* fileLines(path: string): AsyncGenerator<string> {

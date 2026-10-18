@@ -6,6 +6,7 @@
 import { createHash } from "node:crypto";
 import { canonicalJson, frame, parsePayload } from "./canonical.js";
 import {
+  AnchorConflictError,
   mintSealed,
   type Anchor,
   type AuditEntry,
@@ -101,6 +102,37 @@ export interface VerifyOptions {
    * are still present, because a chain with its tail cut off is a valid chain.
    */
   readonly anchor?: Anchor;
+  /**
+   * Several such positions — a journal's worth. Every one is checked as the walk
+   * reaches it, and the lowest that disagrees is the break, so a chain that was
+   * rewritten and re-anchored is reported at the oldest anchor it no longer
+   * matches rather than at the newest. Merged with `anchor` when both are given.
+   */
+  readonly anchors?: readonly Anchor[];
+}
+
+/**
+ * The anchors to check, lowest position first. Checking them in the walk's own
+ * order is what lets one cursor cover all of them in a single pass.
+ */
+function anchorsToCheck(tenant: string, opts: VerifyOptions): Anchor[] {
+  const all = [...(opts.anchor === undefined ? [] : [opts.anchor]), ...(opts.anchors ?? [])];
+  for (const anchor of all) {
+    if (anchor.tenant !== tenant) {
+      throw new Error(`anchor is for tenant "${anchor.tenant}", not "${tenant}"`);
+    }
+  }
+  all.sort((a, b) => a.seq - b.seq);
+  for (let i = 1; i < all.length; i += 1) {
+    const prev = all[i - 1]!;
+    const cur = all[i]!;
+    if (cur.seq === prev.seq && cur.hash !== prev.hash) {
+      // Not a chain break: no chain can satisfy both, so there is nothing to
+      // report about the entries. `readJournal` raises the same error from a file.
+      throw new AnchorConflictError(tenant, cur.seq, prev.hash, cur.hash);
+    }
+  }
+  return all;
 }
 
 /**
@@ -117,14 +149,12 @@ export async function verifyChain(
   entries: AsyncIterable<AuditEntry> | Iterable<AuditEntry>,
   opts: VerifyOptions = {},
 ): Promise<VerificationResult> {
-  const anchor = opts.anchor;
-  if (anchor && anchor.tenant !== tenant) {
-    throw new Error(`anchor is for tenant "${anchor.tenant}", not "${tenant}"`);
-  }
+  const anchors = anchorsToCheck(tenant, opts);
 
   let prev: AuditEntry | undefined;
   let count = 0;
-  let anchorSeen = false;
+  /** How many anchors the walk has passed. Entries and anchors both ascend. */
+  let checked = 0;
 
   const broken = (kind: ChainBreak["kind"], seq: number, detail: string): VerificationResult => ({
     ok: false,
@@ -195,28 +225,35 @@ export async function verifyChain(
       }
     }
 
-    if (anchor && entry.seq === anchor.seq) {
-      if (entry.hash !== anchor.hash) {
+    // Every anchor at or below this position is settled by the time the walk
+    // moves on. An anchor strictly below it cannot be reached by a later entry,
+    // and a chain that skipped one has already failed `bad_genesis` or `missing`.
+    while (checked < anchors.length && anchors[checked]!.seq <= entry.seq) {
+      const anchor = anchors[checked]!;
+      if (anchor.seq === entry.seq && entry.hash !== anchor.hash) {
         return broken(
           "anchor_mismatch",
           entry.seq,
           `the anchor expects ${anchor.hash}, the chain has ${entry.hash}`,
         );
       }
-      anchorSeen = true;
+      checked += 1;
     }
 
     count += 1;
     prev = entry;
   }
 
-  if (anchor && !anchorSeen) {
+  // The lowest anchor the walk never reached: with a journal, that is the oldest
+  // position the chain can no longer account for, not merely the newest.
+  const unreached = anchors[checked];
+  if (unreached !== undefined) {
     return broken(
       "truncated",
-      anchor.seq,
+      unreached.seq,
       prev === undefined
-        ? `the chain is empty, the anchor is at seq ${anchor.seq}`
-        : `the chain ends at seq ${prev.seq}, the anchor is at seq ${anchor.seq}`,
+        ? `the chain is empty, the anchor is at seq ${unreached.seq}`
+        : `the chain ends at seq ${prev.seq}, the anchor is at seq ${unreached.seq}`,
     );
   }
 
