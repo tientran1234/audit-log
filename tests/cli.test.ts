@@ -230,6 +230,211 @@ describe("audit-log usage", () => {
   });
 });
 
+describe("audit-log root", () => {
+  it("prints <size>:<hash> for the whole chain", async () => {
+    const tenant = tenantName();
+    const h = harness(await seed(tenant, 6));
+    expect(await run(["root", "--tenant", tenant], h.io)).toBe(EXIT_OK);
+    expect(h.out[0]).toMatch(/^6:[0-9a-f]{64}$/);
+  });
+
+  it("prints a root over a prefix with --size, and the same one every time", async () => {
+    const tenant = tenantName();
+    const h = harness(await seed(tenant, 6));
+    expect(await run(["root", "--tenant", tenant, "--size", "4"], h.io)).toBe(EXIT_OK);
+    await run(["root", "--tenant", tenant, "--size", "4"], h.io);
+    expect(h.out[0]).toMatch(/^4:[0-9a-f]{64}$/);
+    expect(h.out[0]).toBe(h.out[1]);
+    expect(h.out[0]).not.toBe(`6:${h.out[0]!.slice(2)}`);
+  });
+
+  it("refuses to publish a root for a chain that does not verify", async () => {
+    const tenant = tenantName();
+    const entries = await entriesOf(await seed(tenant, 5), tenant);
+    entries[2] = { ...entries[2]!, action: "something else" };
+    const h = harness(MemoryStore.from(entries));
+
+    expect(await run(["root", "--tenant", tenant], h.io)).toBe(EXIT_BROKEN);
+    expect(h.out[0]).toContain("BROKEN at seq 3");
+  });
+
+  it("reports a chain that no longer reaches a size somebody has a root for", async () => {
+    const tenant = tenantName();
+    const h = harness(await seed(tenant, 3));
+    expect(await run(["root", "--tenant", tenant, "--size", "5"], h.io)).toBe(EXIT_BROKEN);
+    expect(h.out[0]).toContain("truncated");
+  });
+
+  it("says a tenant has no entries instead of rooting nothing", async () => {
+    const tenant = tenantName();
+    const h = harness(new MemoryStore());
+    expect(await run(["root", "--tenant", tenant], h.io)).toBe(EXIT_OK);
+    expect(h.err.join("\n")).toContain("has no entries");
+    expect(h.out).toEqual([]);
+  });
+
+  it("refuses a size that is not a count", async () => {
+    const tenant = tenantName();
+    const h = harness(await seed(tenant, 3));
+    expect(await run(["root", "--tenant", tenant, "--size", "two"], h.io)).toBe(EXIT_USAGE);
+    expect(h.err.join("\n")).toContain("--size must be a positive integer");
+  });
+});
+
+describe("audit-log prove and verify-proof", () => {
+  it("proves one entry, and the proof checks out against the published root", async () => {
+    const tenant = tenantName();
+    const h = harness(await seed(tenant, 9));
+    expect(await run(["root", "--tenant", tenant], h.io)).toBe(EXIT_OK);
+    const root = h.out[0]!;
+
+    expect(await run(["prove", "--tenant", tenant, "--seq", "4"], h.io)).toBe(EXIT_OK);
+    const proof = h.out[1]!;
+
+    // The auditor's side: a file, a root they already had, and no database.
+    const checker = harness(new MemoryStore(), { "proof.json": proof.split("\n") });
+    expect(
+      await run(
+        ["verify-proof", "--proof", "proof.json", "--tenant", tenant, "--root", root],
+        checker.io,
+      ),
+    ).toBe(EXIT_OK);
+    expect(checker.out[0]).toContain("seq 4 is in the log of 9 entries");
+  });
+
+  it("exits 1 when the proof does not hold against the root given", async () => {
+    const tenant = tenantName();
+    const h = harness(await seed(tenant, 9));
+    await run(["prove", "--tenant", tenant, "--seq", "4"], h.io);
+    const proof = h.out[0]!;
+
+    const checker = harness(new MemoryStore(), { "proof.json": proof.split("\n") });
+    const other = `9:${"b".repeat(64)}`;
+    expect(
+      await run(
+        ["verify-proof", "--proof", "proof.json", "--tenant", tenant, "--root", other],
+        checker.io,
+      ),
+    ).toBe(EXIT_BROKEN);
+    expect(checker.out[0]).toContain("root_mismatch");
+  });
+
+  it("exits 2 when the proof is for a different size than the root held", async () => {
+    const tenant = tenantName();
+    const h = harness(await seed(tenant, 9));
+    await run(["root", "--tenant", tenant, "--size", "5"], h.io);
+    const rootAt5 = h.out[0]!;
+    await run(["prove", "--tenant", tenant, "--seq", "2"], h.io);
+    const proofAt9 = h.out[1]!;
+
+    const checker = harness(new MemoryStore(), { "proof.json": proofAt9.split("\n") });
+    expect(
+      await run(
+        ["verify-proof", "--proof", "proof.json", "--tenant", tenant, "--root", rootAt5],
+        checker.io,
+      ),
+    ).toBe(EXIT_USAGE);
+    expect(checker.out[0]).toContain("different_commitment");
+  });
+
+  it("exits 1 when the entry in the proof was edited", async () => {
+    const tenant = tenantName();
+    const h = harness(await seed(tenant, 9));
+    await run(["root", "--tenant", tenant], h.io);
+    const root = h.out[0]!;
+    await run(["prove", "--tenant", tenant, "--seq", "4"], h.io);
+    const edited = JSON.parse(h.out[1]!) as { entry: Record<string, unknown> };
+    edited.entry["actor"] = "somebody else";
+
+    const checker = harness(new MemoryStore(), {
+      "proof.json": JSON.stringify(edited).split("\n"),
+    });
+    expect(
+      await run(
+        ["verify-proof", "--proof", "proof.json", "--tenant", tenant, "--root", root],
+        checker.io,
+      ),
+    ).toBe(EXIT_BROKEN);
+    expect(checker.out[0]).toContain("entry_tampered");
+  });
+
+  it("refuses to check a proof against the root the proof itself carries", async () => {
+    const tenant = tenantName();
+    const h = harness(await seed(tenant, 4));
+    await run(["prove", "--tenant", tenant, "--seq", "2"], h.io);
+    const checker = harness(new MemoryStore(), { "proof.json": h.out[0]!.split("\n") });
+
+    expect(
+      await run(["verify-proof", "--proof", "proof.json", "--tenant", tenant], checker.io),
+    ).toBe(EXIT_USAGE);
+    expect(checker.err.join("\n")).toContain("cannot vouch for itself");
+  });
+
+  it("works on an export, for a log whose database is gone", async () => {
+    const tenant = tenantName();
+    const h = harness(await seed(tenant, 7));
+    expect(await run(["export", "--tenant", tenant], h.io)).toBe(EXIT_OK);
+    const ndjson = [...h.out];
+
+    const archive = harness(new MemoryStore(), { "acme.ndjson": ndjson });
+    expect(
+      await run(["root", "--tenant", tenant, "--file", "acme.ndjson"], archive.io),
+    ).toBe(EXIT_OK);
+    const root = archive.out[0]!;
+    expect(root).toMatch(/^7:[0-9a-f]{64}$/);
+
+    const prover = harness(new MemoryStore(), { "acme.ndjson": ndjson });
+    expect(
+      await run(
+        ["prove", "--tenant", tenant, "--seq", "3", "--file", "acme.ndjson"],
+        prover.io,
+      ),
+    ).toBe(EXIT_OK);
+
+    const checker = harness(new MemoryStore(), { "proof.json": prover.out[0]!.split("\n") });
+    expect(
+      await run(
+        ["verify-proof", "--proof", "proof.json", "--tenant", tenant, "--root", root],
+        checker.io,
+      ),
+    ).toBe(EXIT_OK);
+  });
+
+  it("needs a --seq, because a proof is about one entry", async () => {
+    const tenant = tenantName();
+    const h = harness(await seed(tenant, 4));
+    expect(await run(["prove", "--tenant", tenant], h.io)).toBe(EXIT_USAGE);
+    expect(h.err.join("\n")).toContain("--seq is required");
+  });
+
+  it("reports a proof asked for past the end of the chain", async () => {
+    const tenant = tenantName();
+    const h = harness(await seed(tenant, 4));
+    expect(await run(["prove", "--tenant", tenant, "--seq", "9"], h.io)).toBe(EXIT_BROKEN);
+    expect(h.out[0]).toContain("truncated");
+  });
+
+  it("exits 2 on a proof file it cannot read as a proof", async () => {
+    const tenant = tenantName();
+    const checker = harness(new MemoryStore(), { "proof.json": ["{\"nope\": true}"] });
+    expect(
+      await run(
+        [
+          "verify-proof",
+          "--proof",
+          "proof.json",
+          "--tenant",
+          tenant,
+          "--root",
+          `4:${"a".repeat(64)}`,
+        ],
+        checker.io,
+      ),
+    ).toBe(EXIT_USAGE);
+    expect(checker.err.join("\n")).toContain("unknown proof format");
+  });
+});
+
 async function entriesOf(store: MemoryStore, tenant: string): Promise<AuditEntry[]> {
   return store.read(tenant, 0, 1000);
 }
