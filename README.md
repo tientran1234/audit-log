@@ -10,6 +10,9 @@ and every hash covers the entry's own fields, its position and the hash before i
 `verify()` reports the first break and what kind it is. With an anchor kept outside
 the database, a chain whose newest entries were deleted is caught too.**
 
+One entry can also be shown on its own: `prove` turns a published root and one
+record into a file an outsider can check without the rest of the log.
+
 ## Usage
 
 ```ts
@@ -66,6 +69,47 @@ $ audit-log verify --tenant acme; echo $?
 acme  BROKEN at seq 1  tampered  the entry hashes to a55f4112…, not d57e86f3…
 1
 ```
+
+### Showing one entry to somebody who may not read the log
+
+A customer disputes one voided invoice, or a regulator asks about one record. The
+chain can demonstrate that entry 41 is intact — by handing over entries 41 to the
+head, every actor, action and payload in them. An inclusion proof is the one entry
+plus one hash per level, and a sibling hash says nothing about the entry it stands
+for.
+
+```
+$ audit-log root --tenant acme                 # publish this like an anchor
+900:4f1c2e8a…
+
+$ audit-log prove --tenant acme --seq 41 > invoice-1001.proof.json
+```
+
+Their side needs the file, the root they already had, and no database:
+
+```
+$ audit-log verify-proof --proof invoice-1001.proof.json \
+    --tenant acme --root 900:4f1c2e8a…
+acme  ok  seq 41 is in the log of 900 entries rooted at 4f1c2e8a…
+```
+
+`--root` is not optional. A proof carries the root it claims, and checking it
+against itself would only prove that its author can add.
+
+```ts
+import { verifyInclusion, decodeProof, parseRoot } from "audit-log";
+
+const result = verifyInclusion(
+  decodeProof(await readFile("invoice-1001.proof.json", "utf8")),
+  // From your records — a ticket, a commit, last quarter's report.
+  parseRoot("acme", "900:4f1c2e8a…"),
+);
+// { ok: false, kind: "root_mismatch", detail: "the path leads to 81b0…, the root you hold is 4f1c…" }
+```
+
+Both commands also take `--file acme.ndjson`, because an export is a chain too —
+and the archive is often the only copy still reachable when somebody asks about a
+record from four years ago.
 
 ## Design decisions
 
@@ -146,6 +190,68 @@ two verification paths from disagreeing, `verifyChain` also rejects an entry who
 stored text is not canonical — something only a writer that is not this package can
 produce.
 
+**The tree is derived, and the chain is still what proves the log.** No column, no
+trigger and no change to `append`: a root is computed from the entry hashes the
+table already holds, when somebody asks. The chain verifies in one pass and
+explains a break in one sentence, which is what an audit table needs; the tree
+exists for the one thing a chain cannot do, which is show a single record without
+its neighbours. The cost is a full read per root or proof, and that is the right
+trade — you already pay it for `verify`, and a proof is something you produce when
+an auditor asks, not on every append.
+
+**A root is only issued for a chain that has just verified.** `rootOfChain`
+streams the entries through `verifyChain` and feeds the builder from the ones it
+accepts, so a break comes back instead of a root. Publishing a root over an
+unverified prefix would put this package's name on whatever is in the table. It is
+one pass and O(log n) hashes — one subtree per set bit of the count — so a log
+larger than memory commits the same way a short one does.
+
+**An odd node is promoted, never duplicated.** Hashing the last leaf twice to even
+out a level — the familiar Bitcoin construction — gives three leaves the same root
+as four whose last two are equal, so one root commits to two different logs. The
+split rule is RFC 6962's: the left subtree is the largest power of two below the
+size. `tests/merkle.test.ts` asserts the two roots differ, and checks the
+streaming builder against a recursive transcription of MTH and PATH for every size
+up to 129 and every position up to 17 — the stack folding is the part that is easy
+to get quietly wrong.
+
+**A path is a list of hashes, with no directions in it.** Whether a sibling joins
+on the left or the right is a function of `seq` and `size`, derived while
+verifying, so a proof cannot misstate its own shape. The length is checked against
+the one that position must have *before* the fold, which turns a padded or trimmed
+path into "the path has 4 steps, seq 41 of 900 needs 10" instead of a walk that
+ends on a hash that happens to match.
+
+**The root has to come from the verifier's own records, and the type says so.**
+`PublishedRoot` carries a brand declared in `src/merkle.ts` and never exported, so
+only `parseRoot` and `AuditLog.root()` can produce one and a proof cannot be
+passed where a trusted root is wanted. `tests/log.test.ts` pins it with a
+`@ts-expect-error`: drop the brand and `pnpm typecheck` fails. Like `SealedEntry`,
+this is not a defence against someone determined — `parseRoot(t, formatRoot(proof))`
+compiles — it stops the mistake of checking a document against itself, which is
+the one an honest implementation actually makes. The CLI refuses `verify-proof`
+without `--root` for the same reason.
+
+**A root travels with the size it commits to.** Every append produces a different
+root, so `<size>:<hash>`; a bare hash is not checkable six months later because
+"which one was this?" has no answer. Truncation detection falls out of it for
+anyone holding a root: asking for a root over 900 entries when the chain now ends
+at 880 reports `truncated`, with no anchor involved.
+
+**Exit 1 means the proof was checked and failed; exit 2 means it could not be
+checked against that root.** A root for another tenant, a root taken at another
+size, or a path that is not the shape this position needs are all exit 2 — nothing
+was learned about the entry, and the useful answer is "ask for a proof at size
+900". An entry whose hash is not the hash of its fields, and a path that leads
+somewhere else, are exit 1.
+
+**What a proof does not say.** That this entry, with these fields, was at this
+position in the log the root commits to — and nothing about the entries around it.
+It does not show that the log is gapless or that nothing elsewhere was deleted;
+`verify` over the whole chain does that, which is why a root is only issued after
+it passed. The siblings disclose the existence and count of other entries, which
+is the smallest thing a tree can leak and still be a tree.
+
 **`pg` is an optional peer dependency, declared structurally.** `PostgresStore` takes
 anything with `query` and `connect`, so nothing is imported from `pg` at build time
 and the package has no runtime dependencies. The CLI imports it through a variable
@@ -165,9 +271,11 @@ audit-log/
     types.ts              vocabulary, the SealedEntry brand, the store interface
     canonical.ts          canonical JSON, and the length-prefixed framing
     chain.ts              the hash preimage, seal(), and the streaming verifier
-    log.ts                AuditLog: append, verify, head, stream
-    wire.ts               the NDJSON export format and the anchor format
-    cli.ts                verify / checkpoint / export / migrate
+    merkle.ts             the tree over entry hashes, proofs, and their checker
+    log.ts                AuditLog: append, verify, head, stream, root, prove
+    wire.ts               the export, anchor, root and proof formats
+    cli.ts                verify / checkpoint / export / root / prove /
+                          verify-proof / migrate
     store/
       memory.ts           the same guarantees in one process, for tests
       postgres.ts         the durable store
@@ -187,10 +295,19 @@ audit-log/
   them or *when* in wall-clock terms — the writer supplies both. Signing entries
   needs key management, and trustworthy times need a third party; either is a larger
   project than this one.
-- **No Merkle tree.** A linear chain verifies in one pass and explains a break in one
-  sentence. A tree buys short inclusion proofs for a single entry, which matters when
-  a third party verifies one record without seeing the log — a transparency-log
-  problem, not an audit-table one.
+- **No consistency proofs between two roots.** `root` and `prove` are here — see
+  the design notes — because showing one record without the other 899 turned out to
+  be an audit-table problem after all. What is not here is the other half of a
+  transparency log: a proof that the root over 900 entries extends the root over 50,
+  so a client holding both can tell an append from a rewrite without reading the
+  log. The operator can already demonstrate that by replaying the chain, and the
+  audience for a root here is a handful of people who can ask. A log with
+  thousands of independent monitors needs the proof; this is not that.
+- **No log server, no gossip and no witnesses.** A root is a string you publish the
+  way you already publish an anchor. Who published which root when, and whether two
+  readers were shown the same one, is the problem a transparency log exists to
+  solve, and it needs a service and an audience, not a library inside your
+  database.
 - **No retention or pruning.** `audit_entry` grows forever, and the table will not let
   you delete from it. Trimming an audit log means breaking its chain on purpose, so
   it needs a decision — a sealed archive of the removed prefix, a new genesis — that
@@ -212,8 +329,8 @@ audit-log/
 
 ```
 pnpm install
-pnpm test                                   # 118 tests; Postgres suite skipped
-DATABASE_URL=postgres://… pnpm test         # 141 tests
+pnpm test                                   # 173 tests; Postgres suite skipped
+DATABASE_URL=postgres://… pnpm test         # 196 tests
 ```
 
 The suite is written so that removing a guarantee breaks it. Verified by mutation:
@@ -224,3 +341,12 @@ replacing the length-prefixed framing with a `":"` join, dropping the key sort f
 (tenant, seq)` or the append-only trigger from the schema, and removing the
 append retry each fail at least one test. Dropping the `SealedEntry` brand fails
 `pnpm typecheck` instead.
+
+The same for the tree: duplicating the odd leaf instead of promoting it, dropping
+the path-length check, skipping the entry's own hash recomputation, comparing the
+path only against the root the proof carries, ignoring the size a root was taken
+at, swapping the sides while folding a path, rooting a chain without verifying it
+first, accepting a chain shorter than the size asked for, dropping a domain string
+from the leaf preimage, and letting `verify-proof` fall back to the root inside the
+proof all fail at least one test. Dropping the `PublishedRoot` brand fails
+`pnpm typecheck`.

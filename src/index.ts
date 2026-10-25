@@ -9,17 +9,40 @@
  *
  * `seal()` is deliberately not exported: a `SealedEntry` can only be produced
  * inside this package, so no caller can hand a store a hash of its own choosing.
+ * Neither is `mintRoot()`, for the same reason: a trusted root has to come from
+ * the verifier's own records, not from the proof being checked.
  */
 
 export { AuditLog, type AuditLogOptions } from "./log.js";
 export { canonicalJson, parsePayload } from "./canonical.js";
 export { GENESIS_HASH, entryHash, isHash, verifyChain, type VerifyOptions } from "./chain.js";
 export {
+  MerkleBuilder,
+  inclusionPathLength,
+  leafHash,
+  nodeHash,
+  proveInChain,
+  rootOfChain,
+  verifyInclusion,
+  type Broken,
+  type CommitOptions,
+  type InclusionProof,
+  type ProofFailure,
+  type ProofResult,
+  type ProveResult,
+  type PublishedRoot,
+  type RootResult,
+} from "./merkle.js";
+export {
   decodeEntries,
   decodeEntry,
+  decodeProof,
   encodeEntry,
+  encodeProof,
   formatAnchor,
+  formatRoot,
   parseAnchor,
+  parseRoot,
 } from "./wire.js";
 export { MemoryStore } from "./store/memory.js";
 export {

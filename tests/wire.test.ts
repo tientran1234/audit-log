@@ -1,5 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { decodeEntries, decodeEntry, encodeEntry, formatAnchor, parseAnchor } from "../src/wire.js";
+import {
+  decodeEntries,
+  decodeEntry,
+  decodeProof,
+  encodeEntry,
+  encodeProof,
+  formatAnchor,
+  formatRoot,
+  parseAnchor,
+  parseRoot,
+} from "../src/wire.js";
+import { proveInChain } from "../src/merkle.js";
 import { verifyChain } from "../src/chain.js";
 import { MalformedEntryError } from "../src/types.js";
 import { chain, tenantName } from "./helpers.js";
@@ -92,3 +103,63 @@ describe("anchors", () => {
 async function* linesOf(lines: readonly string[]): AsyncGenerator<string> {
   for (const line of lines) yield line;
 }
+
+describe("the root format", () => {
+  it("round-trips a size and a hash", () => {
+    const tenant = tenantName();
+    const root = parseRoot(tenant, `12:${"a".repeat(64)}`);
+    expect(root).toMatchObject({ tenant, size: 12, root: "a".repeat(64) });
+    expect(formatRoot(root)).toBe(`12:${"a".repeat(64)}`);
+  });
+
+  it("refuses a root without a size, or with a size that is not one", () => {
+    const tenant = tenantName();
+    expect(() => parseRoot(tenant, "a".repeat(64))).toThrow(MalformedEntryError);
+    expect(() => parseRoot(tenant, `0:${"a".repeat(64)}`)).toThrow(/positive integer/);
+    expect(() => parseRoot(tenant, "12:nope")).toThrow(/64 hex/);
+  });
+});
+
+describe("the proof format", () => {
+  it("is indented, because somebody has to read the entry in it", async () => {
+    const tenant = tenantName();
+    const proof = await proveInChain(tenant, 2, chain(tenant, 5));
+    if (!proof.ok) throw new Error("expected a proof");
+    const text = encodeProof(proof.proof);
+    expect(text).toContain("\n  \"tenant\"");
+    expect(JSON.parse(text)).toMatchObject({ format: "audit-log/inclusion/v1" });
+  });
+
+  it("refuses a file written under another format", async () => {
+    const tenant = tenantName();
+    const proof = await proveInChain(tenant, 2, chain(tenant, 5));
+    if (!proof.ok) throw new Error("expected a proof");
+    const row = JSON.parse(encodeProof(proof.proof)) as Record<string, unknown>;
+
+    row["format"] = "audit-log/inclusion/v2";
+    expect(() => decodeProof(JSON.stringify(row))).toThrow(/unknown proof format/);
+    delete row["format"];
+    expect(() => decodeProof(JSON.stringify(row))).toThrow(/unknown proof format/);
+  });
+
+  it("refuses a proof whose parts are not what they have to be", async () => {
+    const tenant = tenantName();
+    const proof = await proveInChain(tenant, 2, chain(tenant, 5));
+    if (!proof.ok) throw new Error("expected a proof");
+    const text = encodeProof(proof.proof);
+    const reread = (change: (row: Record<string, unknown>) => void): void => {
+      const row = JSON.parse(text) as Record<string, unknown>;
+      change(row);
+      decodeProof(JSON.stringify(row));
+    };
+
+    expect(() => reread((row) => (row["seq"] = 0))).toThrow(/positive integer/);
+    expect(() => reread((row) => (row["size"] = 1.5))).toThrow(/positive integer/);
+    expect(() => reread((row) => (row["root"] = "short"))).toThrow(/64 hex/);
+    expect(() => reread((row) => (row["path"] = "nope"))).toThrow(/array of hashes/);
+    expect(() => reread((row) => (row["path"] = ["nope"]))).toThrow(/64 hex/);
+    expect(() => reread((row) => delete row["entry"])).toThrow(MalformedEntryError);
+    expect(() => decodeProof("not json")).toThrow(/not valid JSON/);
+    expect(() => decodeProof("[]")).toThrow(/not a JSON object/);
+  });
+});

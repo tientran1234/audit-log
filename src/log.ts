@@ -1,6 +1,13 @@
 import { canonicalJson } from "./canonical.js";
 import { seal, verifyChain, type VerifyOptions } from "./chain.js";
 import {
+  proveInChain,
+  rootOfChain,
+  type CommitOptions,
+  type ProveResult,
+  type RootResult,
+} from "./merkle.js";
+import {
   MalformedEntryError,
   type Anchor,
   type AuditEntry,
@@ -68,6 +75,22 @@ export class AuditLog {
   verify(tenant: string, opts: VerifyOptions = {}): Promise<VerificationResult> {
     const name = required(tenant, "tenant");
     return verifyChain(name, this.stream(name), opts);
+  }
+
+  /**
+   * The Merkle root over the tenant's first `size` entries — the whole chain by
+   * default — after verifying them. Publish it the way you publish an anchor;
+   * `prove` then shows one entry to somebody who may not see the rest.
+   */
+  root(tenant: string, opts: CommitOptions = {}): Promise<RootResult> {
+    const name = required(tenant, "tenant");
+    return rootOfChain(name, this.stream(name), opts);
+  }
+
+  /** An inclusion proof for one entry, against the root over `size` entries. */
+  prove(tenant: string, seq: number, opts: CommitOptions = {}): Promise<ProveResult> {
+    const name = required(tenant, "tenant");
+    return proveInChain(name, seq, this.stream(name), opts);
   }
 
   /** Every entry, oldest first, one page at a time. */
